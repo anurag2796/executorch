@@ -167,6 +167,122 @@ def _minimal_packages() -> List[str]:
     )
 
 
+# The published project names for the CUDA runtime components a CUDA wheel links but
+# does not bundle, keyed by CUDA major version. Not derivable from a suffix rule: the
+# CUDA 12 wheels carry a "-cu12" suffix while the CUDA 13 ones are published under
+# unsuffixed names. A train with no entry here declares nothing rather than guessing a
+# name that may not exist.
+_CUDA_RUNTIME_PACKAGES = {
+    "12": ("nvidia-cuda-runtime-cu12", "nvidia-cublas-cu12", "nvidia-curand-cu12"),
+    "13": ("nvidia-cuda-runtime", "nvidia-cublas", "nvidia-curand"),
+}
+
+# Where each train installs its libraries under site-packages. CUDA 13 collects them in
+# one directory while CUDA 12 gives each component its own, so the search path differs by
+# train and cannot be a single literal.
+_CUDA_LIBRARY_DIRECTORIES = {
+    "12": ("nvidia/cuda_runtime/lib", "nvidia/cublas/lib", "nvidia/curand/lib"),
+    "13": ("nvidia/cu13/lib",),
+}
+
+
+def _cuda_train() -> str:
+    """The CUDA major version this wheel is being built for, or "" for a CPU wheel.
+
+    The release row's own field wins when it is set, because a row states the train it
+    targets and that is more authoritative than whichever toolkit happens to sit on the
+    builder. The wheel build exports CU_VERSION; DESIRED_CUDA is the matrix field name.
+
+    Falling back to the installed toolkit matters for every build that is not a release
+    job. The build turns CUDA on by detecting a toolkit, so keying only off the release
+    field produced a wheel that carried the CUDA libraries with no dependency declarations
+    and no way to find the CUDA runtime.
+
+    Returns "" when the build did not enable CUDA, so a CPU wheel declares nothing even on
+    a machine that has a toolkit installed.
+    """
+    raw = os.environ.get("CU_VERSION") or os.environ.get("DESIRED_CUDA") or ""
+    digits = raw.lstrip("cu").replace(".", "")
+    if digits[:2] in _CUDA_RUNTIME_PACKAGES:
+        return digits[:2]
+
+    # Fall back to the installed toolkit only when the build was asked for CUDA. A release builder can
+    # have a toolkit installed while building a CPU row, and asking the machine there made a CPU wheel
+    # declare a CUDA runtime it never loads, which is several hundred megabytes a user does not need.
+    if os.environ.get("EXECUTORCH_BUILD_CUDA", "").strip() not in (
+        "1",
+        "ON",
+        "on",
+        "true",
+        "TRUE",
+    ):
+        return ""
+    if not install_utils.is_cuda_available():
+        return ""
+    try:
+        major, _ = install_utils._get_cuda_version()
+    except Exception:
+        return ""
+    return str(major) if str(major) in _CUDA_RUNTIME_PACKAGES else ""
+
+
+def _cuda_dependencies() -> List[str]:
+    """Runtime libraries a CUDA wheel needs but does not bundle.
+
+    Declared rather than vendored, the way the PyTorch CUDA wheels do it, so one copy is
+    shared with torch instead of shipping a second one.
+    """
+    train = _cuda_train()
+    return list(_CUDA_RUNTIME_PACKAGES.get(train, ()))
+
+
+# Directories inside the wheel that hold libraries a shipped library links, relative to the directory
+# holding the linking library.
+#
+# The CUDA libraries are split across two directories and reference each other in both directions:
+# the delegate in lib/ links the shims library in backends/cuda/, and the shims library links the
+# stream helper back in lib/. So both hops are needed.
+#
+# Applied to every shipped library rather than mapping each library to the directories it happens to
+# need. An unused hop costs nothing at load time, while a missing one produces a wheel that installs
+# and then fails to load, and a per-library mapping would have to be revisited every time a library
+# moves.
+_SIBLING_LIBRARY_SEARCH_PATHS = (
+    "$ORIGIN/../backends/cuda",
+    "$ORIGIN/../../lib",
+)
+
+
+def _cuda_runtime_search_paths(depth: int = 1) -> List[str]:
+    """Loader paths that reach the CUDA wheels installed beside this one.
+
+    Those wheels install as siblings of this package, so the hop has to climb out of the package first.
+    `depth` is how many directories separate the library from the package root, and the wheel ships
+    libraries at more than one depth: a hop sized for one of them lands inside this package from the
+    other, where nothing is found.
+    """
+    train = _cuda_train()
+    out = "/".join([".."] * (depth + 1))
+    return [
+        f"$ORIGIN/{out}/{directory}"
+        for directory in _CUDA_LIBRARY_DIRECTORIES.get(train, ())
+    ]
+
+
+def _package_relative_depth(library: Path) -> int:
+    """How many directories separate a shipped library from the installed package root.
+
+    Searched from the END of the path. At build time the path is absolute and a source checkout is
+    often named after the package too, so taking the first match found the checkout instead of the
+    package inside the build output and produced a hop that climbs out of the install directory.
+    """
+    parts = list(Path(library).parts)
+    if "executorch" not in parts:
+        return 1
+    index = len(parts) - 1 - parts[::-1].index("executorch")
+    return max(len(parts) - index - 2, 0)
+
+
 def _base_dependencies() -> List[str]:
     """Runtime dependencies for the full wheel.
 
@@ -683,6 +799,23 @@ class InstallerBuildExt(build_ext):
             os.chmod(src_file, os.stat(src_file).st_mode | 0o222)
 
 
+def _append_relative_search_paths(entries: List[str], depth: int = 1) -> None:
+    """Add the relative hops a shipped library needs, skipping any already present.
+
+    Two kinds, both relative so the wheel works wherever the environment lives:
+    the CUDA runtime, which arrives in its own wheel installed beside this one, and a sibling
+    ExecuTorch library that the wheel installs in a different directory from the library linking it.
+
+    `depth` sizes the hop out of this package, since the wheel ships libraries at more than one depth.
+    """
+    for search_path in (
+        *_cuda_runtime_search_paths(depth),
+        *_SIBLING_LIBRARY_SEARCH_PATHS,
+    ):
+        if search_path not in entries:
+            entries.append(search_path)
+
+
 def _strip_absolute_runtime_paths(library: Path) -> None:
     """Remove unusable runtime search paths from a library the wheel ships.
 
@@ -742,7 +875,14 @@ def _strip_absolute_runtime_paths(library: Path) -> None:
             marker in entry for marker in ("/pip-out/", "/cmake-out", "/build/lib.")
         )
 
-    rewritten = ":".join(entry for entry in original.split(":") if keep(entry))
+    entries = [entry for entry in original.split(":") if keep(entry)]
+    # A CUDA wheel links the CUDA runtime from a separate wheel installed beside this
+    # one, so the loader needs a relative hop to reach it. Without this the library
+    # resolves the runtime only through the absolute toolkit path the linker recorded,
+    # which names the build machine and will not exist for a user who installed from an
+    # index. Appended, so a path already present keeps its position.
+    _append_relative_search_paths(entries, _package_relative_depth(library))
+    rewritten = ":".join(entries)
     if rewritten == original:
         return
     subprocess.run(
@@ -1152,6 +1292,10 @@ class CustomBuild(build):
             if cmake_cache.is_enabled("EXECUTORCH_BUILD_CUDA"):
                 cmake_build_args += ["--target", "aoti_cuda_backend"]
                 cmake_build_args += ["--target", "aoti_common_shims_slim"]
+                if cmake_cache.is_enabled("EXECUTORCH_BUILD_SHARED"):
+                    # The stream helper ships as its own library so a process has one
+                    # of it. Named because nothing else in a wheel build links it.
+                    cmake_build_args += ["--target", "extension_cuda"]
 
             if cmake_cache.is_enabled("EXECUTORCH_BUILD_EXTENSION_MODULE"):
                 cmake_build_args += ["--target", "extension_module"]
@@ -1203,7 +1347,9 @@ if _is_minimal_build():
     setup_kwargs["packages"] = _minimal_packages()
     setup_kwargs["install_requires"] = _minimal_dependencies()
 else:
-    setup_kwargs["install_requires"] = _base_dependencies()
+    # A CUDA wheel links the CUDA runtime but does not bundle it, so the wheels that
+    # carry it are declared here. A CPU wheel adds nothing.
+    setup_kwargs["install_requires"] = _base_dependencies() + _cuda_dependencies()
 
 
 setup(
@@ -1290,6 +1436,28 @@ setup(
                     dependent_cmake_flags=[
                         "EXECUTORCH_BUILD_SHARED",
                         "EXECUTORCH_BUILD_KERNELS_OPTIMIZED",
+                    ],
+                ),
+                # The CUDA delegate and the process-wide CUDA stream helper, for a
+                # wheel built from a CUDA index. Only present when the build asks for
+                # CUDA, so packaging requires that rather than looking for files a
+                # CPU-only build never produced.
+                BuiltFile(
+                    src_dir="%CMAKE_CACHE_DIR%/backends/cuda/",
+                    src_name="libexecutorch_backend_cuda.so",
+                    dst="executorch/lib/libexecutorch_backend_cuda.so",
+                    dependent_cmake_flags=[
+                        "EXECUTORCH_BUILD_SHARED",
+                        "EXECUTORCH_BUILD_CUDA",
+                    ],
+                ),
+                BuiltFile(
+                    src_dir="%CMAKE_CACHE_DIR%/extension/cuda/",
+                    src_name="libexecutorch_extension_cuda.so",
+                    dst="executorch/lib/libexecutorch_extension_cuda.so",
+                    dependent_cmake_flags=[
+                        "EXECUTORCH_BUILD_SHARED",
+                        "EXECUTORCH_BUILD_CUDA",
                     ],
                 ),
                 # The quantized kernels, as their own library rather than code
