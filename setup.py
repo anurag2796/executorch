@@ -823,9 +823,10 @@ class CustomBuildPy(build_py):
                     "share/cmake/executorch-config.cmake",
                 ),
             ]
-            # Copy all the necessary headers into include/executorch/ so that they can
-            # be found in the pip package. This is the subset of headers that are
-            # essential for building custom ops extensions.
+            # The headers the package installs. Two audiences now: a custom-operator
+            # build, which needs the kernel and tensor helpers, and a C++ application
+            # using the shipped libraries as an SDK, which needs the documented entry
+            # points as well.
             # TODO: Use cmake to gather the headers instead of hard-coding them here.
             # For example:
             # https://discourse.cmake.org/t/installing-headers-the-modern-way-regurgitated-and-revisited/3238/3
@@ -838,6 +839,19 @@ class CustomBuildPy(build_py):
                 "extension/kernel_util/",
                 "extension/tensor/",
                 "extension/threadpool/",
+                # Module is how the documentation tells a C++ application to load and
+                # run a program. Without it the package ships the libraries to do that
+                # and no way to call them, which the C++ consumer check catches.
+                "extension/module/",
+                # Module's constructors take unique_ptr to the runtime's allocator
+                # and loader bases, whose headers already ship. These supply the
+                # concrete subclasses a caller has to construct to pass one, such as
+                # MallocMemoryAllocator and FileDataLoader.
+                "extension/memory_allocator/",
+                "extension/data_loader/",
+                # ETDump, whose library the package ships as a component. A profiler
+                # that cannot be included is a library nobody can call.
+                "devtools/etdump/",
             ]:
                 src_list = Path(include_dir).rglob("*.h")
                 for src in src_list:
@@ -877,6 +891,51 @@ class CustomBuildPy(build_py):
                     dst_file = os.path.join(dst_dir, rel_path)
                     self.mkpath(os.path.dirname(dst_file))
                     self.copy_file(src_file, dst_file, preserve_mode=False)
+
+        if not _is_minimal_build():
+            self._write_cmake_version_file(dst_root)
+
+    def _write_cmake_version_file(self, dst_root: str) -> None:
+        """Write the CMake package version file, so `find_package(executorch 1.2)` works.
+
+        Generated rather than copied, because the version is only known here:
+        version.txt gives the base and BUILD_VERSION overrides it for a nightly. A
+        checked-in file would go stale the first time either changed.
+        """
+        template = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "tools",
+            "cmake",
+            "executorch-wheel-config-version.cmake.in",
+        )
+        destination = os.path.join(
+            dst_root, "share", "cmake", "executorch-config-version.cmake"
+        )
+        with open(template) as handle:
+            contents = handle.read()
+        # Only the numeric release part. A Python version can carry a local segment
+        # such as "1.5.0+cpu" or a development suffix, and `find_package(executorch
+        # 1.5.0+cpu)` is rejected by CMake as an invalid argument, so a consumer could
+        # not name the version this file reports. Strip to the dotted numbers CMake
+        # can compare, which is what a consumer asks for in practice.
+        # Two variables with different jobs. CMake compares PACKAGE_VERSION, so it has to be the
+        # numeric release and nothing else. EXECUTORCH_BUILD_VERSION is documented as the full
+        # version, which is what a consumer pinning an exact build compares against, so filling it
+        # from the numeric part would make that comparison pass against a different wheel.
+        build_version = Version.string()
+        cmake_version = re.match(r"\d+(?:\.\d+)*", build_version)
+        if not cmake_version:
+            # A version file claiming 0 would satisfy every version request, which is worse than
+            # not building at all.
+            raise RuntimeError(
+                f"cannot derive a numeric CMake version from {build_version!r}; the version file "
+                "would claim 0 and satisfy every version request"
+            )
+        contents = contents.replace("@EXECUTORCH_VERSION@", cmake_version.group(0))
+        contents = contents.replace("@EXECUTORCH_BUILD_VERSION@", build_version)
+        self.mkpath(os.path.dirname(destination))
+        with open(destination, "w") as handle:
+            handle.write(contents)
 
 
 class Buck2EnvironmentFixer(contextlib.AbstractContextManager):
